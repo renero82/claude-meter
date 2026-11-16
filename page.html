@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="it" translate="no">
+<head>
+<meta charset="utf-8">
+<meta name="google" content="notranslate">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Meter</title>
+<style>
+  :root {
+    --bg: #0e0e10; --card: #1e1e22; --text: #eceae4; --dim: #96948e; --track: #3a3a40;
+    --green: #4cc478; --amber: #f0aa3c; --red: #e85448; --accent: #d97757;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: var(--bg); color: var(--text);
+    font-family: "Helvetica Neue", Helvetica, Arial, "DejaVu Sans", sans-serif; overflow: hidden; }
+  /* tutto in unita' relative: va bene da 480x320 a 1920x1080 */
+  body { display: flex; flex-direction: column; padding: 2.5vmin 3.5vmin; gap: 2.5vmin; font-size: 3.2vmin; }
+  header { display: flex; align-items: baseline; justify-content: space-between; }
+  .brand { font-size: 6vmin; font-weight: 700; color: var(--accent); }
+  .brand span { color: var(--text); font-weight: 400; margin-left: .4em; }
+  #status { color: var(--dim); font-size: 3.6vmin; }
+  #status.warn { color: var(--amber); } #status.err { color: var(--red); }
+  main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 3vmin; min-height: 0; }
+  .card { background: var(--card); border-radius: 2.5vmin; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; padding: 2vmin; min-height: 0; }
+  .card h2 { font-size: 5.2vmin; font-weight: 700; }
+  .gauge { position: relative; width: min(62vmin, 92%); aspect-ratio: 1; margin: 1vmin 0 -4vmin; }
+  .gauge svg { width: 100%; height: 100%; }
+  .gauge .val { position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; }
+  .pct { font-size: 11vmin; font-weight: 700; line-height: 1; }
+  .lbl { color: var(--dim); font-size: 3.6vmin; margin-top: .6vmin; }
+  .used { font-size: 3.8vmin; }
+  .reset { color: var(--dim); font-size: 3.4vmin; text-align: center; line-height: 1.35; }
+  footer { text-align: center; color: var(--dim); font-size: 3.2vmin; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">Claude<span id="plan">…</span></div>
+  <div id="status">in attesa dati…</div>
+</header>
+<main>
+  <section class="card" id="five"><h2>Sessione 5 ore</h2></section>
+  <section class="card" id="week"><h2>Settimana</h2></section>
+</main>
+<footer id="tokens">&nbsp;</footer>
+<script>
+const R = 42, C = 2 * Math.PI * R, SWEEP = 0.75; // anello aperto in basso (270 gradi)
+let data = null, gotAt = 0, fails = 0;
+
+function color(left) { return left > 50 ? 'var(--green)' : left > 20 ? 'var(--amber)' : 'var(--red)'; }
+function dur(s) {
+  if (s <= 0) return 'ora';
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return d > 0 ? `${d}g ${h}h` : h > 0 ? `${h}h ${String(m).padStart(2, '0')}m` : `${m}m`;
+}
+function tok(v) {
+  v = v || 0;
+  const s = v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e3 ? Math.round(v / 1e3) + 'k' : String(v);
+  return s.replace('.', ',');
+}
+function card(id, title, w, stale) {
+  const el = document.getElementById(id);
+  if (!w) { el.innerHTML = `<h2>${title}</h2><div class="lbl">n/d</div>`; return; }
+  const remain = (w.reset_in_s || 0) - (Date.now() - gotAt) / 1000;
+  const left = remain <= 0 ? 100 : w.left;   // reset passato senza dati nuovi -> pieno
+  const col = stale ? 'var(--dim)' : color(left);
+  const track = `${C * SWEEP} ${C}`, fill = `${C * SWEEP * left / 100} ${C}`;
+  el.innerHTML = `<h2>${title}</h2>
+    <div class="gauge">
+      <svg viewBox="0 0 100 100"><g transform="rotate(135 50 50)">
+        <circle cx="50" cy="50" r="${R}" fill="none" stroke="var(--track)" stroke-width="9" stroke-dasharray="${track}"/>
+        <circle cx="50" cy="50" r="${R}" fill="none" stroke="${col}" stroke-width="9" stroke-dasharray="${fill}"/>
+      </g></svg>
+      <div class="val"><div class="pct" style="color:${col}">${left}%</div><div class="lbl">residuo</div></div>
+    </div>
+    <div class="used">usato ${100 - left}%</div>
+    <div class="reset">${remain <= 0 ? 'reset avvenuto' : `reset ${w.reset_label}<br>tra ${dur(remain)}`}</div>`;
+}
+function render() {
+  const st = document.getElementById('status');
+  let stale = false; st.className = '';
+  if (!data) { st.textContent = fails ? 'server non raggiungibile' : 'in attesa dati…'; if (fails) st.className = 'err'; }
+  else if (fails >= 3) { st.textContent = 'server non raggiungibile'; st.className = 'err'; stale = true; }
+  else if (!data.ok) { st.textContent = `errore ${data.error} - dato delle ${data.fetched_label || '--:--'}`; st.className = 'warn'; stale = (data.age_s || 0) > 1800; }
+  else st.textContent = `aggiornato ${data.fetched_label}`;
+  if (!data) return;
+  document.getElementById('plan').textContent = data.plan || '';
+  card('five', 'Sessione 5 ore', data.five_hour, stale);
+  card('week', 'Settimana', data.seven_day, stale);
+  const t = data.tokens_today;
+  if (t) document.getElementById('tokens').textContent =
+    `Token oggi sulla VM:  ${tok(t.output)} out  /  ${tok(t.input + t.cache_write)} in  /  ${tok(t.cache_read)} cache`;
+}
+async function poll() {
+  try {
+    const r = await fetch('usage.json', { cache: 'no-store' });
+    if (!r.ok) throw new Error(r.status);
+    data = await r.json(); gotAt = Date.now(); fails = 0;
+  } catch (e) { fails++; }
+  render();
+}
+poll(); setInterval(poll, 30000); setInterval(render, 5000);
+</script>
+</body>
+</html>

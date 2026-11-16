@@ -1,0 +1,8 @@
+fw/.pio/
+fw/local.ini
+*.local.md
+orig/
+__pycache__/
+*.bmp
+kiosk-*.png
+screen.png

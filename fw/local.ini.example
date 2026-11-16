@@ -1,0 +1,5 @@
+; Copia in local.ini (ignorato da git) e metti l'indirizzo del tuo server.
+[env:wt32-sc01-plus]
+build_flags =
+  ${env.build_flags}
+  '-DDEFAULT_SERVER_URL="http://192.168.1.100:8790/usage.json"'
