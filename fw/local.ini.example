@@ -3,3 +3,12 @@
 build_flags =
   ${env.build_flags}
   '-DDEFAULT_SERVER_URL="http://192.168.1.100:8790/usage.json"'
+  ; facoltativo: abilita l'aggiornamento via Wi-Fi (ArduinoOTA) con questa password
+  ; '-DOTA_PASSWORD="una-password-lunga"'
+
+; facoltativo, con OTA_PASSWORD: pio run -e ota -t upload
+; [env:ota]
+; extends = env:wt32-sc01-plus
+; upload_protocol = espota
+; upload_port = <ip-o-nome-della-scheda>
+; upload_flags = --auth=una-password-lunga

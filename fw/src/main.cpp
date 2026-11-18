@@ -5,6 +5,10 @@
 // Wi-Fi: al primo avvio (o tenendo premuto lo schermo 6 s) apre la rete "ClaudeMeter-setup":
 // collegarsi dal telefono e scegliere la rete 2,4 GHz inserendo la password (resta solo sull'ESP32).
 // Tocco breve: aggiorna subito. http://<ip-scheda>/screen.bmp: copia dello schermo.
+//
+// Robustezza Wi-Fi: si collega sempre al nodo (Deco/AP) con il segnale piu' forte, riprova la rete
+// salvata prima di aprire il portale, si riavvia se resta senza Wi-Fi per 5 minuti, cambia nodo se il
+// segnale resta sotto -80 dBm, watchdog hardware sul loop. Diagnostica in http://<ip-scheda>/.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -13,6 +17,11 @@
 #include <Preferences.h>
 #include <WiFiManager.h>
 #include <ArduinoJson.h>
+#include <esp_wifi.h>
+#include <esp_task_wdt.h>
+#ifdef OTA_PASSWORD
+#include <ArduinoOTA.h>  // aggiornamento via Wi-Fi, solo se la password e' definita in local.ini
+#endif
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 
@@ -117,6 +126,17 @@ struct Data {
 } D;
 
 static int failStreak = 0;
+
+// --- stato Wi-Fi per diagnostica e riconnessione ---
+static const char* HOSTNAME = "claude-meter";
+static String wifiSsid, wifiPass;                 // rete salvata (NVS dell'ESP32)
+static volatile uint8_t lastDiscReason = 0;       // codice wifi_err_reason_t dell'ultima disconnessione
+static volatile uint32_t discCount = 0;
+static uint32_t roamCount = 0, wifiDownSince = 0;
+static const uint32_t WIFI_DOWN_RESTART_MS = 5UL * 60 * 1000;
+static const int WEAK_RSSI = -80;
+static const uint32_t WEAK_FOR_MS = 5UL * 60 * 1000, ROAM_EVERY_MS = 30UL * 60 * 1000;
+static const uint32_t WDT_TIMEOUT_S = 120;
 static uint32_t lastFetchMs = 0;
 static const uint32_t FETCH_EVERY_MS = 60000;
 
@@ -204,6 +224,8 @@ static void render() {
   uint16_t stCol = C_DIM;
   if (WiFi.status() != WL_CONNECTED) {
     status = "Wi-Fi assente";
+    if (wifiDownSince) status += " da " + fmtDur((millis() - wifiDownSince) / 1000 + 59);
+    if (lastDiscReason) status += " (motivo " + String(lastDiscReason) + ")";
     stCol = C_RED;
     stale = true;
   } else if (!D.have) {
@@ -235,9 +257,14 @@ static void render() {
   if (D.have) {
     String t = "Token oggi sulla VM:  " + fmtTok(D.tokOut) + " out  /  " + fmtTok(D.tokIn + D.tokCacheW) +
                " in  /  " + fmtTok(D.tokCacheR) + " cache";
-    fb.drawString(t, 240, 294);
+    fb.drawString(t, 240, 286);
   } else {
-    fb.drawString(serverUrl, 240, 294);
+    fb.drawString(serverUrl, 240, 286);
+  }
+  if (WiFi.status() == WL_CONNECTED && WiFi.RSSI() < -75) {
+    fb.setTextColor(C_AMBER);
+    fb.drawString("Wi-Fi debole: " + String(WiFi.RSSI()) + " dBm su " + WiFi.SSID() + " (canale " +
+                      String(WiFi.channel()) + ")", 240, 308);
   }
   fb.pushSprite(0, 0);
 }
@@ -323,6 +350,7 @@ static void handleScreen() {
       row[x * 3 + 0] = p.b; row[x * 3 + 1] = p.g; row[x * 3 + 2] = p.r;
     }
     web.sendContent((const char*)row, rowBytes);
+    esp_task_wdt_reset();  // con segnale debole l'invio puo' durare decine di secondi
   }
 }
 
@@ -330,19 +358,67 @@ static void handleRoot() {
   String s = "{\"server\":\"" + serverUrl + "\",\"have\":" + (D.have ? "true" : "false") +
              ",\"five_used\":" + D.five.used + ",\"week_used\":" + D.week.used +
              ",\"fail_streak\":" + failStreak + ",\"rssi\":" + WiFi.RSSI() +
-             ",\"uptime_s\":" + (millis() / 1000) + "}";
+             ",\"uptime_s\":" + (millis() / 1000) + ",\"ssid\":\"" + WiFi.SSID() + "\",\"bssid\":\"" +
+             WiFi.BSSIDstr() + "\",\"channel\":" + WiFi.channel() + ",\"ip\":\"" + WiFi.localIP().toString() +
+             "\",\"disconnects\":" + discCount + ",\"last_disc_reason\":" + lastDiscReason +
+             ",\"roams\":" + roamCount + ",\"reset_reason\":" + (int)esp_reset_reason() +
+             ",\"heap_free\":" + ESP.getFreeHeap() + "}";
   web.send(200, "application/json", s);
 }
 
 static bool shouldSaveConfig = false;
 
+// Legge SSID e password salvati nella NVS (li scrive WiFiManager dal portale).
+static bool readSavedWifi() {
+  wifi_config_t c;
+  if (esp_wifi_get_config(WIFI_IF_STA, &c) != ESP_OK) return false;
+  wifiSsid = String((const char*)c.sta.ssid).substring(0, 32);
+  wifiPass = String((const char*)c.sta.password).substring(0, 64);
+  return wifiSsid.length() > 0;
+}
+
+// WiFi.begin con SSID/password espliciti: cosi' vale setSortMethod e l'ESP32 sceglie il nodo
+// con il segnale piu' forte tra tutti quelli con lo stesso nome (con WiFi.begin() senza argomenti
+// e con la scansione veloce di serie prende il primo che trova, anche se lontano).
+static void beginStrongest() {
+  if (!wifiSsid.length()) { WiFi.reconnect(); return; }
+  WiFi.disconnect(false, false);
+  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+}
+
+static bool connectStrongest(uint32_t timeoutMs) {
+  beginStrongest();
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) delay(100);
+  return WiFi.status() == WL_CONNECTED;
+}
+
 static void startWifi(bool forcePortal) {
+  WiFi.setHostname(HOSTNAME);  // prima di mode(), altrimenti il DHCP vede esp32s3-xxxx
+  WiFi.mode(WIFI_STA);
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+  WiFi.setAutoReconnect(true);
+  // alimentato da USB: niente risparmio energetico. Con il modem sleep e segnale debole l'ESP32
+  // perde le richieste ARP in broadcast e da alcuni host della LAN risulta irraggiungibile.
+  WiFi.setSleep(false);
+  bool haveSaved = readSavedWifi();
+  if (!forcePortal && haveSaved) {
+    // la rete salvata potrebbe essere solo momentaneamente giu' (Deco che si riavvia):
+    // meglio riprovare qualche volta prima di aprire il portale
+    for (int i = 1; i <= 3; i++) {
+      showMessage("Connessione Wi-Fi", wifiSsid, "tentativo " + String(i) + " di 3",
+                  lastDiscReason ? "ultimo errore: motivo " + String(lastDiscReason) : String(""));
+      if (connectStrongest(20000)) return;
+    }
+  }
   WiFiManager wm;
   WiFiManagerParameter pUrl("server", "URL dati (server sulla VM)", serverUrl.c_str(), 120);
   wm.addParameter(&pUrl);
   wm.setSaveConfigCallback([]() { shouldSaveConfig = true; });
-  wm.setHostname("claude-meter");
-  wm.setConfigPortalTimeout(600);
+  wm.setHostname(HOSTNAME);
+  // con una rete gia' salvata il portale resta aperto meno, poi si riavvia e riprova quella
+  wm.setConfigPortalTimeout(haveSaved && !forcePortal ? 300 : 600);
   wm.setConnectTimeout(30);
   wm.setTitle("Claude Meter");
   wm.setAPCallback([](WiFiManager*) {
@@ -360,11 +436,21 @@ static void startWifi(bool forcePortal) {
     }
   }
   if (!ok) {
-    showMessage("Wi-Fi non configurato", "Riavvio tra 5 secondi...");
+    showMessage("Wi-Fi non collegato", "Riavvio tra 5 secondi...",
+                haveSaved ? "rete salvata: " + wifiSsid : String(""),
+                lastDiscReason ? "ultimo errore: motivo " + String(lastDiscReason) : String(""));
     delay(5000);
     ESP.restart();
   }
+  readSavedWifi();  // eventuale rete nuova scelta dal portale
 }
+
+// Il portale WiFiManager blocca per minuti: il watchdog va sospeso intorno a lui.
+static void wdtOn() {
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);  // riconfigura il TWDT gia' avviato da ESP-IDF
+  esp_task_wdt_add(NULL);
+}
+static void wdtOff() { esp_task_wdt_delete(NULL); }
 
 void setup() {
   Serial.begin(115200);
@@ -385,6 +471,11 @@ void setup() {
   fb.setPsram(true);
   fb.createSprite(lcd.width(), lcd.height());
 
+  WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info) {
+    lastDiscReason = info.wifi_sta_disconnected.reason;
+    discCount++;
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
   prefs.begin("cmeter", false);
   serverUrl = prefs.getString("url", serverUrl);
 
@@ -402,13 +493,28 @@ void setup() {
   web.on("/", handleRoot);
   web.on("/screen.bmp", handleScreen);
   web.begin();
-  Serial.printf("IP %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("IP %s su %s %s ch %d, %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.SSID().c_str(),
+                WiFi.BSSIDstr().c_str(), WiFi.channel(), WiFi.RSSI());
   fetchData();
   render();
+#ifdef OTA_PASSWORD
+  ArduinoOTA.setHostname(HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    wdtOff();
+    showMessage("Aggiornamento firmware", "non staccare la corrente");
+  });
+  ArduinoOTA.onError([](ota_error_t) { ESP.restart(); });
+  ArduinoOTA.begin();
+#endif
+  wdtOn();
 }
 
 void loop() {
   web.handleClient();
+#ifdef OTA_PASSWORD
+  ArduinoOTA.handle();
+#endif
   static uint32_t lastRender = 0, touchStart = 0;
   static bool touching = false;
 
@@ -426,15 +532,42 @@ void loop() {
   }
   if (touching && millis() - touchStart > 6000) {  // pressione lunga: nuovo Wi-Fi
     touching = false;
+    wdtOff();
     startWifi(true);
+    wdtOn();
     fetchData();
   }
 
   if (millis() - lastFetchMs > FETCH_EVERY_MS) fetchData();
   if (millis() - lastRender > 5000) { render(); lastRender = millis(); }
+  // --- sorveglianza Wi-Fi ---
+  static uint32_t lastRe = 0, weakSince = 0, lastRoam = 0;
   if (WiFi.status() != WL_CONNECTED) {
-    static uint32_t lastRe = 0;
-    if (millis() - lastRe > 30000) { WiFi.reconnect(); lastRe = millis(); }
+    if (!wifiDownSince) wifiDownSince = millis();
+    weakSince = 0;
+    if (millis() - lastRe > 30000) { beginStrongest(); lastRe = millis(); }
+    if (millis() - wifiDownSince > WIFI_DOWN_RESTART_MS) {  // lo stack Wi-Fi a volte non si riprende
+      Serial.println("Wi-Fi assente da 5 minuti: riavvio");
+      showMessage("Wi-Fi assente da 5 minuti", "Riavvio...");
+      delay(1000);
+      ESP.restart();
+    }
+  } else {
+    wifiDownSince = 0;
+    if (WiFi.RSSI() < WEAK_RSSI) {
+      if (!weakSince) weakSince = millis();
+    } else {
+      weakSince = 0;
+    }
+    // segnale debole da 5 minuti: riprova a collegarsi scegliendo il nodo piu' forte (max ogni 30 min)
+    if (weakSince && millis() - weakSince > WEAK_FOR_MS && (!lastRoam || millis() - lastRoam > ROAM_EVERY_MS)) {
+      Serial.printf("segnale debole (%d dBm): cerco un nodo migliore\n", WiFi.RSSI());
+      lastRoam = millis();
+      weakSince = 0;
+      roamCount++;
+      beginStrongest();
+    }
   }
+  esp_task_wdt_reset();
   delay(10);
 }

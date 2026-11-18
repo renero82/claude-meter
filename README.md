@@ -77,6 +77,27 @@ pio run -t upload
 - Se il reset arriva prima di un nuovo dato, l'anello torna da solo al 100%. Se il server non
   risponde, gli anelli diventano grigi.
 
+### Wi-Fi robusto
+
+- Si collega sempre al nodo con il segnale più forte tra quelli con lo stesso SSID (utile con le
+  reti mesh): l'ESP32 di serie prende il primo che trova, anche se lontano.
+- All'avvio riprova la rete salvata 3 volte prima di aprire il portale, che poi si chiude dopo
+  5 minuti e la scheda riprova.
+- Se resta senza Wi-Fi per 5 minuti si riavvia. Se il segnale resta sotto −80 dBm per 5 minuti
+  cerca un nodo migliore (al massimo ogni 30 minuti). Watchdog hardware sul loop.
+- Con segnale sotto −75 dBm lo schermo mostra in basso SSID, dBm e canale.
+- `http://<ip-scheda>/` riporta anche `ssid`, `bssid`, `channel`, `disconnects`, `last_disc_reason`
+  (codice `wifi_err_reason_t`), `roams` e `reset_reason`.
+
+### Aggiornamento via Wi-Fi (facoltativo)
+
+Definisci `OTA_PASSWORD` e l'ambiente `ota` in `local.ini` (vedi `local.ini.example`), carica una
+volta via USB, poi:
+
+```bash
+pio run -e ota -t upload
+```
+
 ## Licenza
 
 MIT. Progetto non ufficiale, non affiliato ad Anthropic.
